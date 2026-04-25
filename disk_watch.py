@@ -13,6 +13,8 @@ from pathlib import Path
 INTERVAL = 30
 LOW_GB_THRESHOLD = 200
 LOW_REPEAT_MINUTES = 10
+CRITICAL_FREE_GB = 20
+EMERGENCY_DROP_GB = 20
 
 TARGET_USER_ENV_VAR = "DISK_WATCH_USER"
 USER = os.environ.get(TARGET_USER_ENV_VAR)
@@ -50,6 +52,17 @@ TOP_PROCESSES = 30
 FS_USAGE_MAX_SAMPLE_LINES = 400
 FS_USAGE_MAX_SAMPLE_LINES_PER_PROCESS = 80
 FS_USAGE_SUMMARY_LIMIT = 20
+UNIFIED_LOG_WINDOW_MINUTES = 15
+UNIFIED_LOG_PREDICATE = (
+    '(process == "corespotlightd" OR '
+    'process == "mds_stores" OR '
+    'process == "mds" OR '
+    'process == "fileproviderd" OR '
+    'eventMessage CONTAINS[c] "FileProvider" OR '
+    'eventMessage CONTAINS[c] "spotlightindex" OR '
+    'eventMessage CONTAINS[c] "repair_lookupPath" OR '
+    'eventMessage CONTAINS[c] "forceToOrphanParent")'
+)
 
 HOST = socket.gethostname()
 START_STAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -62,9 +75,11 @@ FS_DISKIO_LOG = LOG_DIR / "fs_usage_diskio.log"
 FS_FILESYS_LOG = LOG_DIR / "fs_usage_filesys.log"
 PROC_LOG = LOG_DIR / "process_snapshot.log"
 LSOF_LOG = LOG_DIR / "lsof_deleted_open.log"
+UNIFIED_LOG = LOG_DIR / "unified_log_spotlight.log"
 DISK_CSV = LOG_DIR / "disk_space.csv"
 
 last_low_capture = 0.0
+last_low_capture_free = None
 
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -205,6 +220,11 @@ def parse_fs_usage_line(line_text):
         "size_bytes": size_bytes,
     }
 
+def decode_subprocess_output(output):
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return output or ""
+
 def fs_usage_sample(kind, seconds, outfile):
     append(outfile, f"\n[{now()}] START fs_usage kind={kind} duration={seconds}s\n")
     try:
@@ -220,9 +240,22 @@ def fs_usage_sample(kind, seconds, outfile):
             p.terminate()
             try:
                 captured, _ = p.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
+                captured = decode_subprocess_output(captured)
+            except subprocess.TimeoutExpired as exc:
+                # Under severe disk pressure fs_usage may not exit promptly;
+                # keep any partial output instead of dropping the whole sample.
+                captured = decode_subprocess_output(exc.output)
                 p.kill()
-                captured, _ = p.communicate(timeout=5)
+                try:
+                    tail_output, _ = p.communicate(timeout=5)
+                    if tail_output:
+                        captured += decode_subprocess_output(tail_output)
+                except subprocess.TimeoutExpired as kill_exc:
+                    captured += decode_subprocess_output(kill_exc.output)
+                    append(
+                        outfile,
+                        f"[{now()}] fs_usage kill timeout kind={kind}; using partial output\n",
+                    )
 
             process_stats = defaultdict(lambda: {
                 "lines": 0,
@@ -317,20 +350,51 @@ def lsof_deleted_open():
     else:
         append(LSOF_LOG, f"FAILED rc={rc} err={err.strip()}\n")
 
-def low_space_capture():
-    global last_low_capture
+def unified_log_snapshot(window_minutes=UNIFIED_LOG_WINDOW_MINUTES):
+    append(
+        UNIFIED_LOG,
+        f"\n[{now()}] running: log show --last {window_minutes}m --style compact --predicate {UNIFIED_LOG_PREDICATE}\n",
+    )
+    rc, out, err = run_cmd(
+        [
+            "/usr/bin/log",
+            "show",
+            "--last",
+            f"{window_minutes}m",
+            "--style",
+            "compact",
+            "--predicate",
+            UNIFIED_LOG_PREDICATE,
+        ],
+        timeout=180,
+    )
+    if rc == 0:
+        append(UNIFIED_LOG, out if out else "[no matching unified log entries found]\n")
+    else:
+        append(UNIFIED_LOG, f"FAILED rc={rc} err={err.strip()}\n")
+
+def low_space_capture(force_reason=None):
+    global last_low_capture, last_low_capture_free
     now_ts = time.time()
-    if now_ts - last_low_capture < LOW_REPEAT_MINUTES * 60:
+    in_cooldown = now_ts - last_low_capture < LOW_REPEAT_MINUTES * 60
+    if in_cooldown and force_reason is None:
         append(MAIN_LOG, f"[{now()}] low-space capture skipped due to cooldown\n")
         return
 
     last_low_capture = now_ts
-    append(MAIN_LOG, f"[{now()}] LOW SPACE capture started\n")
+    total, used, free = disk_free()
+    last_low_capture_free = free
+
+    if force_reason is None:
+        append(MAIN_LOG, f"[{now()}] LOW SPACE capture started\n")
+    else:
+        append(MAIN_LOG, f"[{now()}] LOW SPACE capture started (override: {force_reason})\n")
 
     fs_usage_sample("diskio", 10, FS_DISKIO_LOG)
     fs_usage_sample("filesys", 10, FS_FILESYS_LOG)
     top_processes_snapshot()
     lsof_deleted_open()
+    unified_log_snapshot()
 
     total, used, free = disk_free()
     watched = watch_paths_snapshot()
@@ -339,6 +403,9 @@ def low_space_capture():
     append(MAIN_LOG, f"[{now()}] LOW SPACE capture finished\n")
 
 def main():
+    critical_free_bytes = CRITICAL_FREE_GB * 1024**3
+    emergency_drop_bytes = EMERGENCY_DROP_GB * 1024**3
+
     print(f"Logging to: {LOG_DIR}", flush=True)
     init_disk_csv()
     append(MAIN_LOG, f"[{now()}] started disk watcher on host={HOST} target_user={USER}\n")
@@ -355,7 +422,18 @@ def main():
         print_status(total, used, free, low=low)
 
         if low:
-            low_space_capture()
+            force_reasons = []
+            if free <= critical_free_bytes:
+                force_reasons.append(f"free space critical at {human_bytes(free)}")
+            if last_low_capture_free is not None:
+                drop_since_last_capture = last_low_capture_free - free
+                if drop_since_last_capture >= emergency_drop_bytes:
+                    force_reasons.append(
+                        f"free space dropped by {human_bytes(drop_since_last_capture)} since last capture"
+                    )
+
+            force_reason = "; ".join(force_reasons) if force_reasons else None
+            low_space_capture(force_reason=force_reason)
 
         elapsed = time.time() - cycle_start
         sleep_for = max(1, INTERVAL - elapsed)

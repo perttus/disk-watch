@@ -18,9 +18,10 @@ When free space drops below the low-space threshold:
 - `fs_usage` sample for `filesys`
 - a process snapshot from `ps`
 - deleted-but-still-open files from `lsof +L1`
+- a filtered unified log snapshot for Spotlight, CoreSpotlight, and File Provider activity from the recent incident window
 - `du -skx` size snapshots for selected paths that commonly grow unexpectedly on macOS
 
-The low-space capture has a cooldown, so it will not rerun more than once every 10 minutes.
+The low-space capture has a 10-minute cooldown, but the script now overrides that cooldown if free space keeps dropping sharply or reaches a critical level during the same incident.
 
 ## Watched paths
 
@@ -76,6 +77,7 @@ Each run creates a new directory containing:
 - `fs_usage_filesys.log`: filesystem capture with a per-process summary plus a sampled subset of raw lines
 - `process_snapshot.log`: top process snapshot captured during a low-space event
 - `lsof_deleted_open.log`: deleted files still held open by processes
+- `unified_log_spotlight.log`: filtered `log show` output for Spotlight, CoreSpotlight, and File Provider repair/indexing activity from the last 15 minutes
 
 ## Current defaults
 
@@ -84,7 +86,9 @@ The script currently uses these defaults in `disk_watch.py`:
 - poll interval: 30 seconds
 - low-space threshold: 200 GB free
 - low-space capture cooldown: 10 minutes
+- emergency cooldown override: free space below 20 GB or down by at least 20 GB since the last capture
 - top process rows recorded: 30
+- unified log capture window: last 15 minutes with a Spotlight/File Provider-focused predicate
 - target user comes from `DISK_WATCH_USER`
 
 If you run this on another machine or account, set `DISK_WATCH_USER` accordingly.
@@ -94,9 +98,10 @@ If you run this on another machine or account, set `DISK_WATCH_USER` accordingly
 1. Start the script and leave it running while the intermittent disk growth reproduces.
 2. Inspect `disk_space.csv` to find the time window where free space dropped.
 3. Check `lowspace.log` and the two `fs_usage` logs for the same window.
-4. Compare watched path sizes and look for large changes in caches, containers, Spotlight, or `/private/var/vm`.
-5. Review `lsof_deleted_open.log` for space held by deleted files that processes have not released.
-6. Pay particular attention to the OneDrive group container, File Provider logs, and OneDrive CloudStorage roots if OneDrive disappears or restarts during a low-space event.
+4. Check `unified_log_spotlight.log` for `mds_stores`, `corespotlightd`, `fileproviderd`, `repair_lookupPath`, and `forceToOrphanParent` entries in that window.
+5. Compare watched path sizes and look for large changes in caches, containers, Spotlight, or `/private/var/vm`.
+6. Review `lsof_deleted_open.log` for space held by deleted files that processes have not released.
+7. Pay particular attention to the OneDrive group container, File Provider logs, and OneDrive CloudStorage roots if OneDrive disappears or restarts during a low-space event.
 
 ## Notes
 
