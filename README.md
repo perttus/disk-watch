@@ -17,11 +17,15 @@ When free space drops below the low-space threshold:
 - `fs_usage` sample for `diskio`
 - `fs_usage` sample for `filesys`
 - a process snapshot from `ps`
+- a filtered File Provider plugin snapshot from `pluginkit`
+- a bounded File Provider daemon and domain dump from `fileproviderctl dump -l`
 - deleted-but-still-open files from `lsof +L1`
 - a filtered unified log snapshot for Spotlight, CoreSpotlight, and File Provider activity from the recent incident window
 - `du -skx` size snapshots for selected paths that commonly grow unexpectedly on macOS
 
 The low-space capture has a 10-minute cooldown, but the script now overrides that cooldown if free space keeps dropping sharply or reaches a critical level during the same incident.
+
+If free space is already critically low, the script switches to a smaller capture mode so it does not try to write the largest artifacts while the disk is nearly full. In that mode it still records the most useful lightweight signals immediately, then queues the heaviest artifacts for a deferred capture after free space has recovered to a safer level.
 
 ## Watched paths
 
@@ -35,6 +39,10 @@ The current script tracks these locations:
 - `~/Library/Group Containers/UBF8T346G9.OneDriveSyncClientSuite`
 - OneDrive state directories under that group container, including `.noindex`, staging, hydration, and File Provider areas
 - OneDrive CloudStorage roots such as `~/Library/CloudStorage/OneDrive-Personal`
+- `~/Library/Group Containers/EQHXZ8M8AV.group.com.google.drivefs`
+- Google Drive File Provider storage and state under that group container
+- `~/Library/Application Support/Google/DriveFS`, including log and cache areas
+- Google Drive CloudStorage roots such as `~/Library/CloudStorage/GoogleDrive-*`
 - the parent of macOS temporary `var/folders`
 - LaunchServices cache under `var/folders`
 - `.Spotlight-V100`
@@ -80,6 +88,8 @@ Each run creates a new directory containing:
 - `fs_usage_diskio.log`: disk I/O capture with a per-process summary plus a sampled subset of raw lines
 - `fs_usage_filesys.log`: filesystem capture with a per-process summary plus a sampled subset of raw lines
 - `process_snapshot.log`: top process snapshot captured during a low-space event
+- `file_provider_plugins.log`: File Provider-related extension registrations seen by `pluginkit`
+- `file_provider_dump.log`: bounded `fileproviderctl dump -l` output showing providers and domains
 - `lsof_deleted_open.log`: deleted files still held open by processes
 - `unified_log_spotlight.log`: filtered `log show` output for Spotlight, CoreSpotlight, and File Provider repair/indexing activity from the last 15 minutes
 
@@ -91,6 +101,8 @@ The script currently uses these defaults in `disk_watch.py`:
 - low-space threshold: 200 GB free
 - low-space capture cooldown: 10 minutes
 - emergency cooldown override: free space below 20 GB or down by at least 20 GB since the last capture
+- minimal-log capture mode below 10 GB free to avoid large writes during severe disk pressure
+- deferred heavy capture after recovery above 40 GB free
 - top process rows recorded: 30
 - unified log capture window: last 15 minutes with a Spotlight/File Provider-focused predicate
 - target user defaults to the invoking `sudo` user and can be overridden with `DISK_WATCH_USER`
@@ -101,16 +113,18 @@ If you need to watch a different account than the one invoking `sudo`, set `DISK
 
 1. Start the script and leave it running while the intermittent disk growth reproduces.
 2. Inspect `disk_space.csv` to find the time window where free space dropped.
-3. Check `lowspace.log` and the two `fs_usage` logs for the same window.
-4. Check `unified_log_spotlight.log` for `mds_stores`, `corespotlightd`, `fileproviderd`, `repair_lookupPath`, and `forceToOrphanParent` entries in that window.
-5. Compare watched path sizes and look for large changes in caches, containers, Spotlight, or `/private/var/vm`.
-6. Review `lsof_deleted_open.log` for space held by deleted files that processes have not released.
-7. Pay particular attention to the OneDrive group container, File Provider logs, and OneDrive CloudStorage roots if OneDrive disappears or restarts during a low-space event.
+3. Check `lowspace.log` and the `fs_usage` logs for the same window.
+4. If the incident hit the minimal-log threshold, look in `main.log` for the incident start, recovery, and deferred-capture markers.
+5. Check `unified_log_spotlight.log` for `mds_stores`, `corespotlightd`, `fileproviderd`, `repair_lookupPath`, and `forceToOrphanParent` entries in that window.
+6. Compare watched path sizes and look for large changes in caches, containers, Spotlight, or `/private/var/vm`.
+7. Review `lsof_deleted_open.log` for space held by deleted files that processes have not released when that capture was not skipped due to severe disk pressure.
+8. Pay particular attention to the OneDrive and Google Drive File Provider state, their CloudStorage roots, and their support directories if either provider disappears, pauses, or restarts during a low-space event.
 
 ## Notes
 
 - The watcher measures total filesystem free space, not per-volume free space for arbitrary mount points.
 - Path sizes are collected with `du -skx`, so each watched path stays on its own filesystem.
 - `fs_usage` output is intentionally summarized and sampled so one noisy process does not dominate the log file.
+- When the filesystem is out of space, log writes are treated as best-effort so the watcher keeps running instead of crashing on `OSError: [Errno 28] No space left on device`.
 - Some watched paths, including Spotlight and protected Library subtrees, may still report permission errors even under `sudo`; the script now keeps partial totals when `du` provides one.
 - Because the script writes logs continuously, keep the log directory itself in mind during long runs.

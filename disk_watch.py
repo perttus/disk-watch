@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 from collections import defaultdict
 import csv
+import errno
 import getpass
 import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime
@@ -16,6 +18,8 @@ LOW_GB_THRESHOLD = 200
 LOW_REPEAT_MINUTES = 10
 CRITICAL_FREE_GB = 20
 EMERGENCY_DROP_GB = 20
+MIN_FREE_GB_FOR_HEAVY_LOGS = 10
+RECOVERY_FREE_GB_FOR_DEFERRED_LOGS = 40
 
 TARGET_USER_ENV_VAR = "DISK_WATCH_USER"
 
@@ -37,6 +41,11 @@ USER_HOME = Path(f"/Users/{USER}")
 USER_VAR_FOLDERS = Path(tempfile.gettempdir()).resolve().parent
 ONEDRIVE_GROUP_CONTAINER = USER_HOME / "Library" / "Group Containers" / "UBF8T346G9.OneDriveSyncClientSuite"
 ONEDRIVE_CLOUD_STORAGE = USER_HOME / "Library" / "CloudStorage"
+GOOGLE_DRIVE_GROUP_CONTAINER = USER_HOME / "Library" / "Group Containers" / "EQHXZ8M8AV.group.com.google.drivefs"
+GOOGLE_DRIVE_APP_SUPPORT = USER_HOME / "Library" / "Application Support" / "Google" / "DriveFS"
+GOOGLE_DRIVE_CLOUD_STORAGE_PATHS = sorted(
+    path for path in ONEDRIVE_CLOUD_STORAGE.glob("GoogleDrive-*") if path.is_dir()
+)
 WATCH_PATHS = [
     ("user_library_caches", str(USER_HOME / "Library" / "Caches")),
     ("user_library_app_support", str(USER_HOME / "Library" / "Application Support")),
@@ -52,6 +61,17 @@ WATCH_PATHS = [
     ("onedrive_personal_cloudstorage", str(ONEDRIVE_CLOUD_STORAGE / "OneDrive-Personal")),
     ("onedrive_nitor_cloudstorage", str(ONEDRIVE_CLOUD_STORAGE / "OneDrive-NitorGroup")),
     ("onedrive_sharedlibraries_cloudstorage", str(ONEDRIVE_CLOUD_STORAGE / "OneDrive-SharedLibraries-NitorGroup")),
+    ("google_drive_group_container", str(GOOGLE_DRIVE_GROUP_CONTAINER)),
+    ("google_drive_file_provider_storage", str(GOOGLE_DRIVE_GROUP_CONTAINER / "File Provider Storage")),
+    ("google_drive_group_library", str(GOOGLE_DRIVE_GROUP_CONTAINER / "Library")),
+    ("google_drive_fp_state", str(GOOGLE_DRIVE_GROUP_CONTAINER / "fp")),
+    ("google_drive_app_support", str(GOOGLE_DRIVE_APP_SUPPORT)),
+    ("google_drive_logs", str(GOOGLE_DRIVE_APP_SUPPORT / "Logs")),
+    ("google_drive_cef_cache", str(GOOGLE_DRIVE_APP_SUPPORT / "cef_cache")),
+    *[
+        (f"google_drive_cloudstorage_{index}", str(path))
+        for index, path in enumerate(GOOGLE_DRIVE_CLOUD_STORAGE_PATHS, start=1)
+    ],
     ("user_var_folders", str(USER_VAR_FOLDERS)),
     ("user_launchservices_cache", str(USER_VAR_FOLDERS / "0" / "com.apple.LaunchServices.dv")),
     ("spotlight_store", "/System/Volumes/Data/.Spotlight-V100"),
@@ -86,13 +106,23 @@ FS_FILESYS_LOG = LOG_DIR / "fs_usage_filesys.log"
 PROC_LOG = LOG_DIR / "process_snapshot.log"
 LSOF_LOG = LOG_DIR / "lsof_deleted_open.log"
 UNIFIED_LOG = LOG_DIR / "unified_log_spotlight.log"
+FILE_PROVIDER_PLUGINS_LOG = LOG_DIR / "file_provider_plugins.log"
+FILE_PROVIDER_DUMP_LOG = LOG_DIR / "file_provider_dump.log"
 DISK_CSV = LOG_DIR / "disk_space.csv"
 
 last_low_capture = 0.0
 last_low_capture_free = None
+reported_log_write_failures = set()
+current_incident_started_at = None
+current_incident_lowest_free = None
+current_incident_needs_deferred_capture = False
+pending_deferred_captures = []
 
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def format_timestamp(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 def line(char="-", width=100):
     return char * width
@@ -107,26 +137,59 @@ def human_bytes(n):
             return f"{x:,.2f} {unit}"
         x /= 1024.0
 
+def report_log_write_failure(path, exc):
+    key = (str(path), exc.errno)
+    if key in reported_log_write_failures:
+        return
+
+    reported_log_write_failures.add(key)
+    print(
+        f"[{now()}] log write skipped for {path}: {exc.strerror}",
+        file=sys.stderr,
+        flush=True,
+    )
+
 def append(path, text):
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(text)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text)
+        return True
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            report_log_write_failure(path, exc)
+            return False
+        raise
 
 def init_disk_csv():
-    with open(DISK_CSV, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "timestamp",
-            "host",
-            "disk_total_bytes",
-            "disk_used_bytes",
-            "disk_free_bytes",
-            "low_space",
-        ])
+    try:
+        with open(DISK_CSV, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp",
+                "host",
+                "disk_total_bytes",
+                "disk_used_bytes",
+                "disk_free_bytes",
+                "low_space",
+            ])
+        return True
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            report_log_write_failure(DISK_CSV, exc)
+            return False
+        raise
 
 def write_interval_csv(timestamp, total, used, free, low):
-    with open(DISK_CSV, "a", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([timestamp, HOST, total, used, free, int(low)])
+    try:
+        with open(DISK_CSV, "a", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([timestamp, HOST, total, used, free, int(low)])
+        return True
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            report_log_write_failure(DISK_CSV, exc)
+            return False
+        raise
 
 def run_cmd(cmd, timeout=120):
     try:
@@ -352,6 +415,32 @@ def top_processes_snapshot():
     else:
         append(PROC_LOG, f"FAILED rc={rc} err={err.strip()}\n")
 
+def file_provider_plugins_snapshot():
+    append(FILE_PROVIDER_PLUGINS_LOG, f"\n[{now()}] running: pluginkit -m -A -D\n")
+    rc, out, err = run_cmd(["/usr/bin/pluginkit", "-m", "-A", "-D"], timeout=120)
+    if rc != 0:
+        append(FILE_PROVIDER_PLUGINS_LOG, f"FAILED rc={rc} err={err.strip()}\n")
+        return
+
+    relevant_lines = []
+    for line_text in out.splitlines():
+        lowered = line_text.lower()
+        if "fileprovider" in lowered or "fpext" in lowered:
+            relevant_lines.append(line_text)
+
+    if relevant_lines:
+        append(FILE_PROVIDER_PLUGINS_LOG, "\n".join(relevant_lines) + "\n")
+    else:
+        append(FILE_PROVIDER_PLUGINS_LOG, "[no File Provider related plugins found]\n")
+
+def file_provider_dump_snapshot():
+    append(FILE_PROVIDER_DUMP_LOG, f"\n[{now()}] running: fileproviderctl dump -l\n")
+    rc, out, err = run_cmd(["/usr/bin/fileproviderctl", "dump", "-l"], timeout=180)
+    if rc == 0:
+        append(FILE_PROVIDER_DUMP_LOG, out if out else "[no File Provider dump output]\n")
+    else:
+        append(FILE_PROVIDER_DUMP_LOG, f"FAILED rc={rc} err={err.strip()}\n")
+
 def lsof_deleted_open():
     append(LSOF_LOG, f"\n[{now()}] running: lsof +L1\n")
     rc, out, err = run_cmd(["/usr/sbin/lsof", "-nP", "+L1"], timeout=120)
@@ -383,8 +472,48 @@ def unified_log_snapshot(window_minutes=UNIFIED_LOG_WINDOW_MINUTES):
     else:
         append(UNIFIED_LOG, f"FAILED rc={rc} err={err.strip()}\n")
 
+def unified_log_snapshot_range(start_time, end_time):
+    start_text = format_timestamp(start_time)
+    end_text = format_timestamp(end_time)
+    append(
+        UNIFIED_LOG,
+        f"\n[{now()}] running: log show --start {start_text} --end {end_text} --style compact --predicate {UNIFIED_LOG_PREDICATE}\n",
+    )
+    rc, out, err = run_cmd(
+        [
+            "/usr/bin/log",
+            "show",
+            "--start",
+            start_text,
+            "--end",
+            end_text,
+            "--style",
+            "compact",
+            "--predicate",
+            UNIFIED_LOG_PREDICATE,
+        ],
+        timeout=180,
+    )
+    if rc == 0:
+        append(UNIFIED_LOG, out if out else "[no matching unified log entries found]\n")
+    else:
+        append(UNIFIED_LOG, f"FAILED rc={rc} err={err.strip()}\n")
+
+def deferred_heavy_capture(capture):
+    start_time = capture["start_time"]
+    recovered_time = capture["recovered_time"]
+    lowest_free = capture["lowest_free"]
+    append(
+        MAIN_LOG,
+        f"[{now()}] deferred heavy capture started for incident start={format_timestamp(start_time)} "
+        f"recovered={format_timestamp(recovered_time)} lowest_free={human_bytes(lowest_free)}\n",
+    )
+    file_provider_dump_snapshot()
+    unified_log_snapshot_range(start_time, recovered_time)
+    append(MAIN_LOG, f"[{now()}] deferred heavy capture finished\n")
+
 def low_space_capture(force_reason=None):
-    global last_low_capture, last_low_capture_free
+    global current_incident_needs_deferred_capture, last_low_capture, last_low_capture_free
     now_ts = time.time()
     in_cooldown = now_ts - last_low_capture < LOW_REPEAT_MINUTES * 60
     if in_cooldown and force_reason is None:
@@ -394,17 +523,35 @@ def low_space_capture(force_reason=None):
     last_low_capture = now_ts
     total, used, free = disk_free()
     last_low_capture_free = free
+    minimal_capture = free <= MIN_FREE_GB_FOR_HEAVY_LOGS * 1024**3
 
     if force_reason is None:
         append(MAIN_LOG, f"[{now()}] LOW SPACE capture started\n")
     else:
         append(MAIN_LOG, f"[{now()}] LOW SPACE capture started (override: {force_reason})\n")
 
+    if minimal_capture:
+        current_incident_needs_deferred_capture = True
+        notice = (
+            f"[{now()}] LOW SPACE capture using minimal logging at free={human_bytes(free)}; "
+            "deferring large log artifacts until recovery\n"
+        )
+        append(MAIN_LOG, notice)
+        print(notice.strip(), flush=True)
+
     fs_usage_sample("diskio", 10, FS_DISKIO_LOG)
-    fs_usage_sample("filesys", 10, FS_FILESYS_LOG)
     top_processes_snapshot()
-    lsof_deleted_open()
-    unified_log_snapshot()
+    file_provider_plugins_snapshot()
+    if minimal_capture:
+        append(
+            MAIN_LOG,
+            f"[{now()}] skipped filesys, file_provider_dump, lsof, and unified_log due to low free space\n",
+        )
+    else:
+        fs_usage_sample("filesys", 10, FS_FILESYS_LOG)
+        file_provider_dump_snapshot()
+        lsof_deleted_open()
+        unified_log_snapshot()
 
     total, used, free = disk_free()
     watched = watch_paths_snapshot()
@@ -413,8 +560,10 @@ def low_space_capture(force_reason=None):
     append(MAIN_LOG, f"[{now()}] LOW SPACE capture finished\n")
 
 def main():
+    global current_incident_lowest_free, current_incident_needs_deferred_capture, current_incident_started_at
     critical_free_bytes = CRITICAL_FREE_GB * 1024**3
     emergency_drop_bytes = EMERGENCY_DROP_GB * 1024**3
+    deferred_capture_free_bytes = RECOVERY_FREE_GB_FOR_DEFERRED_LOGS * 1024**3
 
     print(f"Logging to: {LOG_DIR}", flush=True)
     init_disk_csv()
@@ -432,6 +581,17 @@ def main():
         print_status(total, used, free, low=low)
 
         if low:
+            if current_incident_started_at is None:
+                current_incident_started_at = datetime.now()
+                current_incident_lowest_free = free
+                current_incident_needs_deferred_capture = False
+                append(
+                    MAIN_LOG,
+                    f"[{now()}] incident started at free={human_bytes(free)}\n",
+                )
+            else:
+                current_incident_lowest_free = min(current_incident_lowest_free, free)
+
             force_reasons = []
             if free <= critical_free_bytes:
                 force_reasons.append(f"free space critical at {human_bytes(free)}")
@@ -444,6 +604,39 @@ def main():
 
             force_reason = "; ".join(force_reasons) if force_reasons else None
             low_space_capture(force_reason=force_reason)
+        else:
+            if current_incident_started_at is not None:
+                recovered_time = datetime.now()
+                append(
+                    MAIN_LOG,
+                    f"[{now()}] incident recovered at free={human_bytes(free)}\n",
+                )
+                if current_incident_needs_deferred_capture:
+                    pending_deferred_captures.append(
+                        {
+                            "start_time": current_incident_started_at,
+                            "recovered_time": recovered_time,
+                            "lowest_free": current_incident_lowest_free,
+                        }
+                    )
+                    append(
+                        MAIN_LOG,
+                        f"[{now()}] queued deferred heavy capture for incident start={format_timestamp(current_incident_started_at)} "
+                        f"recovered={format_timestamp(recovered_time)} lowest_free={human_bytes(current_incident_lowest_free)}\n",
+                    )
+
+                current_incident_started_at = None
+                current_incident_lowest_free = None
+                current_incident_needs_deferred_capture = False
+
+            if pending_deferred_captures and free >= deferred_capture_free_bytes:
+                append(
+                    MAIN_LOG,
+                    f"[{now()}] running {len(pending_deferred_captures)} deferred heavy capture(s) at free={human_bytes(free)}\n",
+                )
+                for capture in pending_deferred_captures:
+                    deferred_heavy_capture(capture)
+                pending_deferred_captures.clear()
 
         elapsed = time.time() - cycle_start
         sleep_for = max(1, INTERVAL - elapsed)
