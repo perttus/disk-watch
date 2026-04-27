@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from collections import defaultdict
 import csv
+import getpass
 import os
 import shutil
 import socket
@@ -17,12 +18,21 @@ CRITICAL_FREE_GB = 20
 EMERGENCY_DROP_GB = 20
 
 TARGET_USER_ENV_VAR = "DISK_WATCH_USER"
-USER = os.environ.get(TARGET_USER_ENV_VAR)
-if not USER:
-    raise SystemExit(
-        f"{TARGET_USER_ENV_VAR} must be set, for example: "
-        f"sudo {TARGET_USER_ENV_VAR}=your.username python3 disk_watch.py"
-    )
+
+
+def resolve_target_user() -> str:
+    configured_user = os.environ.get(TARGET_USER_ENV_VAR)
+    if configured_user:
+        return configured_user
+
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        return sudo_user
+
+    return getpass.getuser()
+
+
+USER = resolve_target_user()
 USER_HOME = Path(f"/Users/{USER}")
 USER_VAR_FOLDERS = Path(tempfile.gettempdir()).resolve().parent
 ONEDRIVE_GROUP_CONTAINER = USER_HOME / "Library" / "Group Containers" / "UBF8T346G9.OneDriveSyncClientSuite"

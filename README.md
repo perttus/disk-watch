@@ -50,13 +50,17 @@ Run the watcher with `sudo` so `fs_usage` and the other system tooling can colle
 
 ## Running
 
-Set the target macOS account with `DISK_WATCH_USER` and run the watcher from the project root with `sudo`:
+Run the watcher from the project root with `sudo`:
 
 ```bash
-sudo DISK_WATCH_USER=perttu.salonen python3 disk_watch.py
+sudo python3 disk_watch.py
 ```
 
-The script uses `DISK_WATCH_USER` to build the watched `~/Library/...` paths. It exits immediately if the variable is not set.
+By default the script uses the invoking account from `sudo` via `SUDO_USER` to build the watched `~/Library/...` paths. If you need to target a different macOS account, override it explicitly:
+
+```bash
+sudo DISK_WATCH_USER=your.username python3 disk_watch.py
+```
 
 Some macOS locations are still protected by TCC or system policy even when the process runs under `sudo`. In those cases the script logs the permission errors and keeps any partial `du` total that macOS still returns.
 
@@ -89,9 +93,9 @@ The script currently uses these defaults in `disk_watch.py`:
 - emergency cooldown override: free space below 20 GB or down by at least 20 GB since the last capture
 - top process rows recorded: 30
 - unified log capture window: last 15 minutes with a Spotlight/File Provider-focused predicate
-- target user comes from `DISK_WATCH_USER`
+- target user defaults to the invoking `sudo` user and can be overridden with `DISK_WATCH_USER`
 
-If you run this on another machine or account, set `DISK_WATCH_USER` accordingly.
+If you need to watch a different account than the one invoking `sudo`, set `DISK_WATCH_USER` accordingly.
 
 ## Typical workflow
 
