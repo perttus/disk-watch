@@ -18,7 +18,9 @@ When free space drops below the low-space threshold:
 - `fs_usage` sample for `filesys`
 - a process snapshot from `ps`
 - a filtered File Provider plugin snapshot from `pluginkit`
-- a bounded File Provider daemon and domain dump from `fileproviderctl dump -l`
+- an optional bounded File Provider daemon and domain dump from `fileproviderctl dump -l`
+- Spotlight indexing status from `mdutil -a -s`
+- open-file paths for `mds_stores`, summarized and captured from `lsof`
 - deleted-but-still-open files from `lsof +L1`
 - a filtered unified log snapshot for Spotlight, CoreSpotlight, and File Provider activity from the recent incident window
 - `du -skx` size snapshots for selected paths that commonly grow unexpectedly on macOS
@@ -46,6 +48,7 @@ The current script tracks these locations:
 - the parent of macOS temporary `var/folders`
 - LaunchServices cache under `var/folders`
 - `.Spotlight-V100`
+- `/private/var/db/Spotlight-V100`, including BootVolume and Preboot stores
 - `/private/var/vm`
 
 ## Requirements
@@ -70,6 +73,12 @@ By default the script uses the invoking account from `sudo` via `SUDO_USER` to b
 sudo DISK_WATCH_USER=your.username python3 disk_watch.py
 ```
 
+The script leaves `fileproviderctl dump -l` disabled by default because it can wake File Provider state during an incident. If you explicitly want that artifact, opt in:
+
+```bash
+sudo DISK_WATCH_ENABLE_FILE_PROVIDER_DUMP=1 python3 disk_watch.py
+```
+
 Some macOS locations are still protected by TCC or system policy even when the process runs under `sudo`. In those cases the script logs the permission errors and keeps any partial `du` total that macOS still returns.
 
 It creates a timestamped log directory under `logs/`, for example:
@@ -89,8 +98,10 @@ Each run creates a new directory containing:
 - `fs_usage_filesys.log`: filesystem capture with a per-process summary plus a sampled subset of raw lines
 - `process_snapshot.log`: top process snapshot captured during a low-space event
 - `file_provider_plugins.log`: File Provider-related extension registrations seen by `pluginkit`
-- `file_provider_dump.log`: bounded `fileproviderctl dump -l` output showing providers and domains
-- `file_provider_summary.log`: concise per-provider and per-domain summary extracted from the full File Provider dump, including disconnected state, indexer flags, and `keepDownloaded` versus `lazy` item counts
+- `file_provider_dump.log`: either a skip marker or, when explicitly enabled, bounded `fileproviderctl dump -l` output showing providers and domains
+- `file_provider_summary.log`: either a skip marker or, when explicitly enabled, a concise per-provider and per-domain summary extracted from the full File Provider dump, including disconnected state, indexer flags, and `keepDownloaded` versus `lazy` item counts
+- `spotlight_status.log`: `mdutil -a -s` output for current Spotlight indexing status
+- `mds_stores_open_files.log`: per-process `lsof` capture for `mds_stores`, with counts for Spotlight data-store, journal, merge, and IVF vector-index files
 - `lsof_deleted_open.log`: deleted files still held open by processes
 - `unified_log_spotlight.log`: filtered `log show` output for Spotlight, CoreSpotlight, and File Provider repair/indexing activity from the last 15 minutes
 
@@ -107,6 +118,7 @@ The script currently uses these defaults in `disk_watch.py`:
 - top process rows recorded: 30
 - unified log capture window: last 15 minutes with a Spotlight/File Provider-focused predicate
 - target user defaults to the invoking `sudo` user and can be overridden with `DISK_WATCH_USER`
+- `fileproviderctl dump -l` is disabled by default and can be enabled with `DISK_WATCH_ENABLE_FILE_PROVIDER_DUMP=1`
 
 If you need to watch a different account than the one invoking `sudo`, set `DISK_WATCH_USER` accordingly.
 
@@ -129,4 +141,5 @@ If you need to watch a different account than the one invoking `sudo`, set `DISK
 - `fs_usage` output is intentionally summarized and sampled so one noisy process does not dominate the log file.
 - When the filesystem is out of space, log writes are treated as best-effort so the watcher keeps running instead of crashing on `OSError: [Errno 28] No space left on device`.
 - Some watched paths, including Spotlight and protected Library subtrees, may still report permission errors even under `sudo`; the script now keeps partial totals when `du` provides one.
+- When the post-restart incident is driven by Spotlight, `mds_stores_open_files.log` should reveal whether the pressure is concentrated in `.Spotlight-V100`, BootVolume, Preboot, `journalAttr.*`, `tmp.merge.*`, or IVF vector-index files.
 - Because the script writes logs continuously, keep the log directory itself in mind during long runs.

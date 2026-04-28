@@ -23,6 +23,20 @@ MIN_FREE_GB_FOR_HEAVY_LOGS = 10
 RECOVERY_FREE_GB_FOR_DEFERRED_LOGS = 40
 
 TARGET_USER_ENV_VAR = "DISK_WATCH_USER"
+FILE_PROVIDER_DUMP_ENV_VAR = "DISK_WATCH_ENABLE_FILE_PROVIDER_DUMP"
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def resolve_target_user() -> str:
@@ -38,6 +52,7 @@ def resolve_target_user() -> str:
 
 
 USER = resolve_target_user()
+FILE_PROVIDER_DUMP_ENABLED = env_flag(FILE_PROVIDER_DUMP_ENV_VAR, default=False)
 USER_HOME = Path(f"/Users/{USER}")
 USER_VAR_FOLDERS = Path(tempfile.gettempdir()).resolve().parent
 ONEDRIVE_GROUP_CONTAINER = USER_HOME / "Library" / "Group Containers" / "UBF8T346G9.OneDriveSyncClientSuite"
@@ -76,6 +91,9 @@ WATCH_PATHS = [
     ("user_var_folders", str(USER_VAR_FOLDERS)),
     ("user_launchservices_cache", str(USER_VAR_FOLDERS / "0" / "com.apple.LaunchServices.dv")),
     ("spotlight_store", "/System/Volumes/Data/.Spotlight-V100"),
+    ("spotlight_private_store", "/private/var/db/Spotlight-V100"),
+    ("spotlight_boot_volume_store", "/private/var/db/Spotlight-V100/BootVolume"),
+    ("spotlight_preboot_store", "/private/var/db/Spotlight-V100/Preboot"),
     ("swap_and_sleep", "/private/var/vm"),
 ]
 
@@ -107,6 +125,8 @@ FS_FILESYS_LOG = LOG_DIR / "fs_usage_filesys.log"
 PROC_LOG = LOG_DIR / "process_snapshot.log"
 LSOF_LOG = LOG_DIR / "lsof_deleted_open.log"
 UNIFIED_LOG = LOG_DIR / "unified_log_spotlight.log"
+SPOTLIGHT_STATUS_LOG = LOG_DIR / "spotlight_status.log"
+MDS_STORES_OPEN_FILES_LOG = LOG_DIR / "mds_stores_open_files.log"
 FILE_PROVIDER_PLUGINS_LOG = LOG_DIR / "file_provider_plugins.log"
 FILE_PROVIDER_DUMP_LOG = LOG_DIR / "file_provider_dump.log"
 FILE_PROVIDER_SUMMARY_LOG = LOG_DIR / "file_provider_summary.log"
@@ -570,6 +590,16 @@ def file_provider_plugins_snapshot():
         append(FILE_PROVIDER_PLUGINS_LOG, "[no File Provider related plugins found]\n")
 
 def file_provider_dump_snapshot():
+    if not FILE_PROVIDER_DUMP_ENABLED:
+        message = (
+            f"[{now()}] skipped fileproviderctl dump -l; "
+            f"set {FILE_PROVIDER_DUMP_ENV_VAR}=1 to enable it\n"
+        )
+        append(FILE_PROVIDER_DUMP_LOG, "\n" + message)
+        append(FILE_PROVIDER_SUMMARY_LOG, "\n" + message)
+        append(MAIN_LOG, message)
+        return
+
     append(FILE_PROVIDER_DUMP_LOG, f"\n[{now()}] running: fileproviderctl dump -l\n")
     append(FILE_PROVIDER_SUMMARY_LOG, f"\n[{now()}] running: fileproviderctl dump -l\n")
     rc, out, err = run_cmd(["/usr/bin/fileproviderctl", "dump", "-l"], timeout=180)
@@ -587,6 +617,99 @@ def lsof_deleted_open():
         append(LSOF_LOG, out if out else "[no deleted-open files found]\n")
     else:
         append(LSOF_LOG, f"FAILED rc={rc} err={err.strip()}\n")
+
+def spotlight_status_snapshot():
+    append(SPOTLIGHT_STATUS_LOG, f"\n[{now()}] running: mdutil -a -s\n")
+    rc, out, err = run_cmd(["/usr/bin/mdutil", "-a", "-s"], timeout=60)
+    if rc == 0:
+        append(SPOTLIGHT_STATUS_LOG, out if out else "[no mdutil status output]\n")
+    else:
+        append(SPOTLIGHT_STATUS_LOG, f"FAILED rc={rc} err={err.strip()}\n")
+
+def summarize_mds_stores_open_paths(paths):
+    unique_paths = []
+    seen = set()
+    for path in paths:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        unique_paths.append(path)
+
+    counts = {
+        "spotlight_data_store": 0,
+        "spotlight_private_store": 0,
+        "spotlight_boot_volume_store": 0,
+        "spotlight_preboot_store": 0,
+        "journal_attr": 0,
+        "tmp_merge": 0,
+        "ivf_vectors": 0,
+        "temp_files": 0,
+    }
+
+    for path in unique_paths:
+        if path.startswith("/System/Volumes/Data/.Spotlight-V100/"):
+            counts["spotlight_data_store"] += 1
+        if path.startswith("/private/var/db/Spotlight-V100/"):
+            counts["spotlight_private_store"] += 1
+        if path.startswith("/private/var/db/Spotlight-V100/BootVolume/"):
+            counts["spotlight_boot_volume_store"] += 1
+        if path.startswith("/private/var/db/Spotlight-V100/Preboot/"):
+            counts["spotlight_preboot_store"] += 1
+        if "/journalAttr." in path:
+            counts["journal_attr"] += 1
+        if "/tmp.merge." in path:
+            counts["tmp_merge"] += 1
+        if ".ivf-" in path:
+            counts["ivf_vectors"] += 1
+        if path.startswith("/private/var/folders/"):
+            counts["temp_files"] += 1
+
+    lines = [
+        f"unique_paths={len(unique_paths)}",
+        f"spotlight_data_store_paths={counts['spotlight_data_store']}",
+        f"spotlight_private_store_paths={counts['spotlight_private_store']}",
+        f"spotlight_boot_volume_paths={counts['spotlight_boot_volume_store']}",
+        f"spotlight_preboot_paths={counts['spotlight_preboot_store']}",
+        f"journal_attr_paths={counts['journal_attr']}",
+        f"tmp_merge_paths={counts['tmp_merge']}",
+        f"ivf_vector_paths={counts['ivf_vectors']}",
+        f"temp_paths={counts['temp_files']}",
+    ]
+    return unique_paths, "\n".join(lines) + "\n"
+
+def mds_stores_open_files_snapshot():
+    append(MDS_STORES_OPEN_FILES_LOG, f"\n[{now()}] running: pgrep -x mds_stores\n")
+    rc, out, err = run_cmd(["/usr/bin/pgrep", "-x", "mds_stores"], timeout=30)
+    if rc != 0:
+        append(MDS_STORES_OPEN_FILES_LOG, f"FAILED rc={rc} err={err.strip()}\n")
+        return
+
+    pids = [line.strip() for line in out.splitlines() if line.strip()]
+    if not pids:
+        append(MDS_STORES_OPEN_FILES_LOG, "[no mds_stores process found]\n")
+        return
+
+    for pid in pids:
+        append(MDS_STORES_OPEN_FILES_LOG, f"[{now()}] running: lsof -nP -Fn -p {pid}\n")
+        rc, out, err = run_cmd(["/usr/sbin/lsof", "-nP", "-Fn", "-p", pid], timeout=120)
+        if rc != 0:
+            append(MDS_STORES_OPEN_FILES_LOG, f"pid={pid} FAILED rc={rc} err={err.strip()}\n")
+            continue
+
+        paths = []
+        for line_text in out.splitlines():
+            if line_text.startswith("n"):
+                path = line_text[1:]
+                if path:
+                    paths.append(path)
+
+        unique_paths, summary = summarize_mds_stores_open_paths(paths)
+        append(MDS_STORES_OPEN_FILES_LOG, f"pid={pid}\n")
+        append(MDS_STORES_OPEN_FILES_LOG, summary)
+        if unique_paths:
+            append(MDS_STORES_OPEN_FILES_LOG, "\n".join(unique_paths) + "\n")
+        else:
+            append(MDS_STORES_OPEN_FILES_LOG, "[no open file paths captured]\n")
 
 def unified_log_snapshot(window_minutes=UNIFIED_LOG_WINDOW_MINUTES):
     append(
@@ -681,10 +804,12 @@ def low_space_capture(force_reason=None):
     fs_usage_sample("diskio", 10, FS_DISKIO_LOG)
     top_processes_snapshot()
     file_provider_plugins_snapshot()
+    spotlight_status_snapshot()
+    mds_stores_open_files_snapshot()
     if minimal_capture:
         append(
             MAIN_LOG,
-            f"[{now()}] skipped filesys, file_provider_dump, lsof, and unified_log due to low free space\n",
+            f"[{now()}] skipped filesys, file_provider_dump, deleted-file lsof, and unified_log due to low free space\n",
         )
     else:
         fs_usage_sample("filesys", 10, FS_FILESYS_LOG)
@@ -707,6 +832,11 @@ def main():
     print(f"Logging to: {LOG_DIR}", flush=True)
     init_disk_csv()
     append(MAIN_LOG, f"[{now()}] started disk watcher on host={HOST} target_user={USER}\n")
+    if not FILE_PROVIDER_DUMP_ENABLED:
+        append(
+            MAIN_LOG,
+            f"[{now()}] fileproviderctl dump disabled by default; set {FILE_PROVIDER_DUMP_ENV_VAR}=1 to enable it\n",
+        )
 
     while True:
         cycle_start = time.time()
