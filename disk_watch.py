@@ -4,6 +4,7 @@ import csv
 import errno
 import getpass
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -108,7 +109,10 @@ LSOF_LOG = LOG_DIR / "lsof_deleted_open.log"
 UNIFIED_LOG = LOG_DIR / "unified_log_spotlight.log"
 FILE_PROVIDER_PLUGINS_LOG = LOG_DIR / "file_provider_plugins.log"
 FILE_PROVIDER_DUMP_LOG = LOG_DIR / "file_provider_dump.log"
+FILE_PROVIDER_SUMMARY_LOG = LOG_DIR / "file_provider_summary.log"
 DISK_CSV = LOG_DIR / "disk_space.csv"
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 last_low_capture = 0.0
 last_low_capture_free = None
@@ -415,6 +419,138 @@ def top_processes_snapshot():
     else:
         append(PROC_LOG, f"FAILED rc={rc} err={err.strip()}\n")
 
+def strip_ansi(text):
+    return ANSI_ESCAPE_RE.sub("", text)
+
+def clean_file_provider_text(text):
+    return " ".join(strip_ansi(text).strip().split())
+
+def file_provider_detail(line_text):
+    if ":" not in line_text:
+        return None
+    return clean_file_provider_text(line_text.split(":", 1)[1])
+
+def summarize_file_provider_dump(output):
+    providers = []
+    current_provider = None
+    current_domain = None
+    lines = output.splitlines()
+    index = 0
+
+    while index < len(lines):
+        raw_line = lines[index]
+        line_text = clean_file_provider_text(raw_line)
+
+        if (
+            raw_line.startswith("=")
+            and index + 2 < len(lines)
+            and lines[index + 2].startswith("=")
+        ):
+            if current_domain is not None and current_provider is not None:
+                current_provider["domains"].append(current_domain)
+                current_domain = None
+            if current_provider is not None:
+                providers.append(current_provider)
+            current_provider = {
+                "provider_id": lines[index + 1].strip(),
+                "display_name": None,
+                "domains": [],
+            }
+            index += 3
+            continue
+
+        if current_provider is None:
+            index += 1
+            continue
+
+        if line_text.startswith("+ display name:"):
+            current_provider["display_name"] = file_provider_detail(line_text)
+        elif line_text.startswith("domain:"):
+            if current_domain is not None:
+                current_provider["domains"].append(current_domain)
+            current_domain = {
+                "name": file_provider_detail(line_text),
+                "status": "connected",
+                "enabled": None,
+                "indexing": None,
+                "needs_auth": None,
+                "needs_indexing": None,
+                "pending_indexable": None,
+                "total_indexable": None,
+                "extension_error": None,
+                "keep_downloaded": 0,
+                "lazy": 0,
+            }
+        elif current_domain is not None:
+            if "temporarily disconnected:" in line_text:
+                current_domain["status"] = clean_file_provider_text(
+                    line_text.split("temporarily disconnected:", 1)[1].rstrip(")")
+                )
+            elif line_text.startswith("enabled:"):
+                current_domain["enabled"] = file_provider_detail(line_text)
+            elif line_text.startswith("indexing:"):
+                current_domain["indexing"] = file_provider_detail(line_text)
+            elif line_text.startswith("needs-auth:"):
+                current_domain["needs_auth"] = file_provider_detail(line_text)
+            elif line_text.startswith("needs-indexing:"):
+                current_domain["needs_indexing"] = file_provider_detail(line_text)
+            elif line_text.startswith("pending-indexable-count:"):
+                current_domain["pending_indexable"] = file_provider_detail(line_text)
+            elif line_text.startswith("total-indexable-count:"):
+                current_domain["total_indexable"] = file_provider_detail(line_text)
+            elif line_text.startswith("can't dump the extension:"):
+                current_domain["extension_error"] = file_provider_detail(line_text)
+
+            if "cp:keepDownloaded" in raw_line:
+                current_domain["keep_downloaded"] += 1
+            if "cp:lazy" in raw_line:
+                current_domain["lazy"] += 1
+
+        index += 1
+
+    if current_domain is not None and current_provider is not None:
+        current_provider["domains"].append(current_domain)
+    if current_provider is not None:
+        providers.append(current_provider)
+
+    if not providers:
+        return "[no File Provider domains summarized]\n"
+
+    summary_lines = []
+    for provider in providers:
+        display_name = provider["display_name"] or provider["provider_id"]
+        summary_lines.append(
+            f"provider={provider['provider_id']} display_name={display_name} domains={len(provider['domains'])}"
+        )
+        if not provider["domains"]:
+            summary_lines.append("  [no domains found]")
+            continue
+
+        for domain in provider["domains"]:
+            summary_lines.append(f"  domain={domain['name']}")
+            summary_lines.append(f"    status={domain['status']}")
+            summary_lines.append(
+                "    "
+                f"indexer_enabled={domain['enabled'] or 'n/a'} "
+                f"indexing={domain['indexing'] or 'n/a'} "
+                f"needs_auth={domain['needs_auth'] or 'n/a'} "
+                f"needs_indexing={domain['needs_indexing'] or 'n/a'}"
+            )
+            summary_lines.append(
+                "    "
+                f"total_indexable={domain['total_indexable'] or 'n/a'} "
+                f"pending_indexable={domain['pending_indexable'] or 'n/a'}"
+            )
+            summary_lines.append(
+                "    "
+                f"keep_downloaded_items={domain['keep_downloaded']} "
+                f"lazy_items={domain['lazy']}"
+            )
+            if domain["extension_error"]:
+                summary_lines.append(f"    extension_error={domain['extension_error']}")
+
+    return "\n".join(summary_lines) + "\n"
+
 def file_provider_plugins_snapshot():
     append(FILE_PROVIDER_PLUGINS_LOG, f"\n[{now()}] running: pluginkit -m -A -D\n")
     rc, out, err = run_cmd(["/usr/bin/pluginkit", "-m", "-A", "-D"], timeout=120)
@@ -435,11 +571,14 @@ def file_provider_plugins_snapshot():
 
 def file_provider_dump_snapshot():
     append(FILE_PROVIDER_DUMP_LOG, f"\n[{now()}] running: fileproviderctl dump -l\n")
+    append(FILE_PROVIDER_SUMMARY_LOG, f"\n[{now()}] running: fileproviderctl dump -l\n")
     rc, out, err = run_cmd(["/usr/bin/fileproviderctl", "dump", "-l"], timeout=180)
     if rc == 0:
         append(FILE_PROVIDER_DUMP_LOG, out if out else "[no File Provider dump output]\n")
+        append(FILE_PROVIDER_SUMMARY_LOG, summarize_file_provider_dump(out))
     else:
         append(FILE_PROVIDER_DUMP_LOG, f"FAILED rc={rc} err={err.strip()}\n")
+        append(FILE_PROVIDER_SUMMARY_LOG, f"FAILED rc={rc} err={err.strip()}\n")
 
 def lsof_deleted_open():
     append(LSOF_LOG, f"\n[{now()}] running: lsof +L1\n")

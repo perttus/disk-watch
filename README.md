@@ -90,6 +90,7 @@ Each run creates a new directory containing:
 - `process_snapshot.log`: top process snapshot captured during a low-space event
 - `file_provider_plugins.log`: File Provider-related extension registrations seen by `pluginkit`
 - `file_provider_dump.log`: bounded `fileproviderctl dump -l` output showing providers and domains
+- `file_provider_summary.log`: concise per-provider and per-domain summary extracted from the full File Provider dump, including disconnected state, indexer flags, and `keepDownloaded` versus `lazy` item counts
 - `lsof_deleted_open.log`: deleted files still held open by processes
 - `unified_log_spotlight.log`: filtered `log show` output for Spotlight, CoreSpotlight, and File Provider repair/indexing activity from the last 15 minutes
 
@@ -115,10 +116,11 @@ If you need to watch a different account than the one invoking `sudo`, set `DISK
 2. Inspect `disk_space.csv` to find the time window where free space dropped.
 3. Check `lowspace.log` and the `fs_usage` logs for the same window.
 4. If the incident hit the minimal-log threshold, look in `main.log` for the incident start, recovery, and deferred-capture markers.
-5. Check `unified_log_spotlight.log` for `mds_stores`, `corespotlightd`, `fileproviderd`, `repair_lookupPath`, and `forceToOrphanParent` entries in that window.
-6. Compare watched path sizes and look for large changes in caches, containers, Spotlight, or `/private/var/vm`.
-7. Review `lsof_deleted_open.log` for space held by deleted files that processes have not released when that capture was not skipped due to severe disk pressure.
-8. Pay particular attention to the OneDrive and Google Drive File Provider state, their CloudStorage roots, and their support directories if either provider disappears, pauses, or restarts during a low-space event.
+5. Check `file_provider_summary.log` first to see which File Provider domains were mounted, disconnected, or still index-enabled during the incident.
+6. Check `unified_log_spotlight.log` for `mds_stores`, `corespotlightd`, `fileproviderd`, `repair_lookupPath`, and `forceToOrphanParent` entries in that window.
+7. Compare watched path sizes and look for large changes in caches, containers, Spotlight, or `/private/var/vm`.
+8. Review `lsof_deleted_open.log` for space held by deleted files that processes have not released when that capture was not skipped due to severe disk pressure.
+9. Pay particular attention to the OneDrive and Google Drive File Provider state, their CloudStorage roots, and their support directories if either provider disappears, pauses, or restarts during a low-space event.
 
 ## Notes
 
