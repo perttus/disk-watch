@@ -2,7 +2,11 @@
 
 Small macOS-focused utility for catching short-lived disk space drops that are hard to reproduce manually.
 
+It is also useful when a disk-space problem may have been building quietly for a long time and only becomes obvious after free space reaches a tipping point. In that situation, continuous free-space monitoring helps distinguish a sudden one-off spike from a longer deterioration that only surfaced late.
+
 The script polls free space on `/` every 30 seconds, writes a time series CSV, and when free space drops below a threshold it captures a deeper snapshot of disk activity and large watched directories. This is useful when the disk appears to fill up temporarily and then recover before you can inspect it.
+
+For the broader Spotlight-specific findings and operational takeaways from the incident that motivated this tool, see [SPOTLIGHT_INCIDENT_SUMMARY.md](SPOTLIGHT_INCIDENT_SUMMARY.md).
 
 ## What it captures
 
@@ -59,6 +63,8 @@ The current script tracks these locations:
 
 Run the watcher with `sudo` so `fs_usage` and the other system tooling can collect the data you need.
 
+If you need to inspect protected Spotlight paths such as `/System/Volumes/Data/.Spotlight-V100`, `sudo` may still not be enough on its own. In practice, the terminal app may also need Full Disk Access before `du`, `ncdu`, or similar tools can inspect those paths reliably.
+
 ## Running
 
 Run the watcher from the project root with `sudo`:
@@ -80,6 +86,16 @@ sudo DISK_WATCH_ENABLE_FILE_PROVIDER_DUMP=1 python3 disk_watch.py
 ```
 
 Some macOS locations are still protected by TCC or system policy even when the process runs under `sudo`. In those cases the script logs the permission errors and keeps any partial `du` total that macOS still returns.
+
+If you grant Full Disk Access for this purpose, treat it as a broad permission for that terminal app: commands, scripts, and child processes launched from it inherit the same access.
+
+If you want a short post-reboot check instead of the long-running watcher, run:
+
+```bash
+sudo python3 boot_spotlight_check.py
+```
+
+That helper samples `mds_stores` for 90 seconds, checks `mdutil -a -s`, summarizes open Spotlight store files, and exits with `0` when no clear issue is seen or `2` when the reboot looks suspicious. You can shorten or extend the window with `--duration` and `--interval`.
 
 It creates a timestamped log directory under `logs/`, for example:
 
@@ -105,6 +121,12 @@ Each run creates a new directory containing:
 - `lsof_deleted_open.log`: deleted files still held open by processes
 - `unified_log_spotlight.log`: filtered `log show` output for Spotlight, CoreSpotlight, and File Provider repair/indexing activity from the last 15 minutes
 
+Each `boot_spotlight_check.py` run creates a `logs/boot_spotlight_check_<timestamp>/` directory containing:
+
+- `report.txt`: sample-by-sample classification and final verdict
+- `mdutil_status.log`: raw `mdutil -a -s` output for each sample
+- `mds_stores_open_files.log`: per-sample `lsof` output grouped by `mds_stores` PID
+
 ## Current defaults
 
 The script currently uses these defaults in `disk_watch.py`:
@@ -124,7 +146,7 @@ If you need to watch a different account than the one invoking `sudo`, set `DISK
 
 ## Typical workflow
 
-1. Start the script and leave it running while the intermittent disk growth reproduces.
+1. Start the script and leave it running continuously so it can capture both gradual free-space erosion and sharp incident drops.
 2. Inspect `disk_space.csv` to find the time window where free space dropped.
 3. Check `lowspace.log` and the `fs_usage` logs for the same window.
 4. If the incident hit the minimal-log threshold, look in `main.log` for the incident start, recovery, and deferred-capture markers.
@@ -142,4 +164,6 @@ If you need to watch a different account than the one invoking `sudo`, set `DISK
 - When the filesystem is out of space, log writes are treated as best-effort so the watcher keeps running instead of crashing on `OSError: [Errno 28] No space left on device`.
 - Some watched paths, including Spotlight and protected Library subtrees, may still report permission errors even under `sudo`; the script now keeps partial totals when `du` provides one.
 - When the post-restart incident is driven by Spotlight, `mds_stores_open_files.log` should reveal whether the pressure is concentrated in `.Spotlight-V100`, BootVolume, Preboot, `journalAttr.*`, `tmp.merge.*`, or IVF vector-index files.
+- As a mitigation, it can be worth excluding very large or high-file-count folders from Spotlight using the system privacy settings when those paths do not need to be searchable.
+- That kind of exclusion mainly affects future indexing pressure; it does not necessarily remove already indexed data from an existing Spotlight store until the index is reset or rebuilt.
 - Because the script writes logs continuously, keep the log directory itself in mind during long runs.
