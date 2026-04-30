@@ -4,6 +4,8 @@ Small macOS-focused utility for catching short-lived disk space drops that are h
 
 It is also useful when a disk-space problem may have been building quietly for a long time and only becomes obvious after free space reaches a tipping point. In that situation, continuous free-space monitoring helps distinguish a sudden one-off spike from a longer deterioration that only surfaced late.
 
+That matters because once free space gets tight enough, the resulting storage pressure can destabilize the machine more broadly, especially during heavy disk I/O or when memory pressure forces more swapping.
+
 The script polls free space on `/` every 30 seconds, writes a time series CSV, and when free space drops below a threshold it captures a deeper snapshot of disk activity and large watched directories. This is useful when the disk appears to fill up temporarily and then recover before you can inspect it.
 
 For the broader Spotlight-specific findings and operational takeaways from the incident that motivated this tool, see [SPOTLIGHT_INCIDENT_SUMMARY.md](SPOTLIGHT_INCIDENT_SUMMARY.md).
@@ -162,6 +164,7 @@ If you need to watch a different account than the one invoking `sudo`, set `DISK
 - Path sizes are collected with `du -skx`, so each watched path stays on its own filesystem.
 - `fs_usage` output is intentionally summarized and sampled so one noisy process does not dominate the log file.
 - When the filesystem is out of space, log writes are treated as best-effort so the watcher keeps running instead of crashing on `OSError: [Errno 28] No space left on device`.
+- Severe free-space loss can be a system-stability problem, not just a storage accounting problem; under heavy disk activity or swap pressure, the machine may become much less responsive or start failing in harder-to-diagnose ways.
 - Some watched paths, including Spotlight and protected Library subtrees, may still report permission errors even under `sudo`; the script now keeps partial totals when `du` provides one.
 - When the post-restart incident is driven by Spotlight, `mds_stores_open_files.log` should reveal whether the pressure is concentrated in `.Spotlight-V100`, BootVolume, Preboot, `journalAttr.*`, `tmp.merge.*`, or IVF vector-index files.
 - As a mitigation, it can be worth excluding very large or high-file-count folders from Spotlight using the system privacy settings when those paths do not need to be searchable.

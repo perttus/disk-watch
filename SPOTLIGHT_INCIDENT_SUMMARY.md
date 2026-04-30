@@ -10,6 +10,7 @@ The key lessons were:
 - `mds_stores` was doing real compaction and merge work, not just idling
 - the actual disk usage was concentrated in one giant Spotlight index file
 - the problem may have been building for a long time before it became obvious at low free-space levels
+- once free space is severely constrained, overall system instability can follow more easily under heavy disk I/O or swap pressure
 - giving Full Disk Access to the terminal was necessary to inspect the store reliably
 - the pathological store later collapsed back to a normal size on its own
 
@@ -24,6 +25,8 @@ The failure pattern looked like this:
 - free space later returned in one large jump without explicit cleanup
 
 One plausible interpretation is that the underlying store growth had been happening earlier and only became visible once remaining free space fell below a practical tipping point. In other words, the visible outage may be the last stage of a longer deterioration rather than a purely sudden one-shot event.
+
+That distinction matters because the disk-space collapse itself can be enough to destabilize the machine. Once free space gets tight, heavy disk activity, memory pressure, or swap growth can amplify the failure and turn a storage problem into broader system instability.
 
 ## What Confirmed The Cause
 
@@ -156,6 +159,7 @@ If someone else hits a similar macOS disk-space collapse, the most useful checks
 7. Monitor free space continuously, because a long-running indexing problem may stay mostly hidden until available headroom gets low enough that the next growth burst becomes user-visible.
 8. Consider excluding especially noisy high-file-count folders from Spotlight in System Settings privacy controls if they do not need to be searchable.
 9. Do not assume a privacy exclusion immediately removes already indexed data from an existing store; if the store is already pathological, a reset or rebuild may still be needed before space is reclaimed.
+10. Treat severe free-space loss as a stability risk in its own right, especially when the machine is also under heavy disk I/O or swap pressure.
 
 ## Local Tools In This Repo
 
